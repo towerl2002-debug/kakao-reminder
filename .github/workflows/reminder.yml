@@ -1,0 +1,75 @@
+name: 카카오톡 일정 알림
+
+on:
+  schedule:
+    - cron: "0 23 * * *"     # 매일 08:00 KST 아침 브리핑 (UTC 23:00)
+    - cron: "*/10 * * * *"   # 10분마다 리마인드 확인
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "실행 모드"
+        type: choice
+        options: [test, brief, remind]
+        default: test
+
+concurrency:
+  group: kakao-reminder
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # 60일 비활동 시 예약 실행이 꺼지지 않도록 다시 켜기 위해 필요
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 모드 결정
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 23 * * *" ]; then
+            echo "mode=brief" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=remind" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 알림 보내기
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          NEW_REFRESH_TOKEN_FILE: ${{ runner.temp }}/new_refresh_token
+        run: python reminder.py "${{ steps.mode.outputs.mode }}"
+
+      # 카카오가 새 refresh token을 주면 GitHub Secret을 자동으로 바꿔 둔다 (GH_PAT 필요)
+      - name: 새 카카오 토큰 저장
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          TOKEN_FILE: ${{ runner.temp }}/new_refresh_token
+        run: |
+          if [ -s "$TOKEN_FILE" ]; then
+            if [ -z "$GH_TOKEN" ]; then
+              echo "::warning::새 카카오 토큰이 발급됐지만 GH_PAT가 없어 저장하지 못했습니다. 한 달 안에 kakao_login.ps1로 다시 로그인하세요."
+            else
+              gh secret set KAKAO_REFRESH_TOKEN --repo "$GITHUB_REPOSITORY" < "$TOKEN_FILE"
+              echo "KAKAO_REFRESH_TOKEN을 갱신했습니다."
+            fi
+          fi
+
+      - name: 예약 실행 유지
+        if: steps.mode.outputs.mode == 'brief'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/reminder.yml/enable" || true
