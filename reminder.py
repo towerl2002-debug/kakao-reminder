@@ -1,8 +1,9 @@
-"""Notion '통합 일정'을 읽어 카카오톡 '나에게 보내기'로 알림을 보낸다.
+"""Notion '통합 일정'과 '할 일'을 읽어 카카오톡 '나에게 보내기'로 알림을 보낸다.
 
 사용법:
-    python reminder.py brief    # 오늘 일정 아침 브리핑
-    python reminder.py remind   # 알림 시점이 된 일정 리마인드 (10분마다 실행)
+    python reminder.py brief    # 아침 8시 브리핑: 오늘 일정과 할 일
+    python reminder.py remind   # 중요 일정의 1주일 전, 3일 전 알림 (아침 8시 이후 1회)
+    python reminder.py test     # 연결 시험
 
 필요한 환경 변수:
     NOTION_TOKEN, NOTION_DATABASE_ID,
@@ -19,19 +20,14 @@ from datetime import date, datetime, time, timedelta, timezone
 KST = timezone(timedelta(hours=9))
 NOTION_VERSION = "2022-06-28"
 
-# 알림 시점 → 일정 시작 몇 분 전에 보낼지
-OFFSETS = {
-    "정시": 0,
-    "10분 전": 10,
-    "30분 전": 30,
-    "1시간 전": 60,
-    "하루 전": 24 * 60,
-}
-DEFAULT_OFFSET = "30분 전"
-# 크론이 늦게 돌아도 일정 시작 후 이 시간까지는 보낸다
-LATE_GRACE = timedelta(minutes=30)
-# 시간 없는(날짜만 있는) 일정에 '하루 전'을 고르면 전날 이 시각에 보낸다
-DATE_ONLY_EVE = time(20, 0)
+# 할 일 표와 일일 보고 표
+TODO_DATABASE_ID = "3fe1927d8b2580c7bf8bde3c8af389c1"
+REPORT_URL = "https://www.notion.so/808f8251095c453fb9c22cc8b91b1fde"
+
+# 중요 일정 알림을 보내기 시작하는 시각
+IMPORTANT_FROM = time(8, 0)
+# 아침 브리핑에 보여 줄 할 일 최대 개수
+TODO_LIMIT = 10
 # 카카오 텍스트 메시지 최대 길이
 KAKAO_TEXT_LIMIT = 200
 
@@ -159,13 +155,48 @@ def notion_query(start_day, end_day):
     return [e for e in (parse_event(p) for p in pages) if e]
 
 
-def notion_mark_sent(page_id):
+def notion_todos(today):
+    """오늘까지 마감인, 끝나지 않은 할 일 목록. 읽지 못하면 None."""
+    payload = {
+        "filter": {
+            "and": [
+                {"property": "마감일", "date": {"on_or_before": today.isoformat()}},
+                {"property": "상태", "status": {"does_not_equal": "완료"}},
+                {"property": "상태", "status": {"does_not_equal": "보류"}},
+                {"property": "완료", "checkbox": {"equals": False}},
+            ]
+        },
+        "sorts": [{"property": "마감일", "direction": "ascending"}],
+        "page_size": TODO_LIMIT + 1,
+    }
+    try:
+        res = http("POST", f"https://api.notion.com/v1/databases/{TODO_DATABASE_ID}/query",
+                   headers=notion_headers(), data=payload)
+    except SystemExit as e:
+        print(f"할 일을 읽지 못했습니다: {e}")
+        return None
+    todos = []
+    for page in res.get("results", []):
+        props = page["properties"]
+        due = ((props.get("마감일") or {}).get("date") or {}).get("start")
+        todos.append({
+            "title": plain(props.get("할 일", {}).get("title")) or "(제목 없음)",
+            "due": date.fromisoformat(due[:10]) if due else None,
+        })
+    return todos
+
+
+def notion_check(page_id, prop):
     http("PATCH", f"https://api.notion.com/v1/pages/{page_id}", headers=notion_headers(),
-         data={"properties": {"알림 보냄": {"checkbox": True}}})
+         data={"properties": {prop: {"checkbox": True}}})
 
 
 def plain(rich):
     return "".join(r.get("plain_text", "") for r in rich or [])
+
+
+def checked(props, name):
+    return (props.get(name) or {}).get("checkbox", False)
 
 
 def parse_event(page):
@@ -182,16 +213,15 @@ def parse_event(page):
         start = start.astimezone(KST)
     else:
         start = datetime.combine(date.fromisoformat(raw), time(0, 0), KST)
-    remind = ((props.get("알림 시점") or {}).get("select") or {}).get("name")
     return {
         "id": page["id"],
         "title": plain(props.get("이름", {}).get("title")) or "(제목 없음)",
         "place": plain(props.get("장소", {}).get("rich_text")),
-        "memo": plain(props.get("메모", {}).get("rich_text")),
         "start": start,
         "has_time": has_time,
-        "remind": remind,
-        "sent": (props.get("알림 보냄") or {}).get("checkbox", False),
+        "important": checked(props, "중요"),
+        "sent_week": checked(props, "1주 전 알림"),
+        "sent_three": checked(props, "3일 전 알림"),
     }
 
 
@@ -217,55 +247,47 @@ def run_brief(now):
         lines.append(f"• {e['start']:%H:%M} {describe(e)}")
     for e in allday:
         lines.append(f"• (종일) {describe(e)}")
+
+    lines.append("")
+    lines.append("✅ 오늘 할 일")
+    todos = notion_todos(today)
+    if todos is None:
+        lines.append("할 일을 읽지 못했어요. 노션 연결을 확인해 주세요.")
+    elif not todos:
+        lines.append("오늘까지 마감인 할 일이 없어요.")
+    else:
+        for t in todos[:TODO_LIMIT]:
+            late = t["due"] is not None and t["due"] < today
+            mark = f" (밀림 {t['due'].month}/{t['due'].day})" if late else ""
+            lines.append(f"• {t['title']}{mark}")
+        if len(todos) > TODO_LIMIT:
+            lines.append("• 더 있어요. 노션에서 확인해 주세요.")
     return "\n".join(lines)
 
 
-def remind_at(event):
-    choice = event["remind"] or DEFAULT_OFFSET
-    if choice == "알림 없음":
-        return None
-    if not event["has_time"]:
-        # 시간 없는 일정은 아침 브리핑으로 안내되고, '하루 전'만 전날 저녁에 따로 보낸다
-        if choice != "하루 전":
-            return None
-        return datetime.combine(event["start"].date() - timedelta(days=1), DATE_ONLY_EVE, KST)
-    return event["start"] - timedelta(minutes=OFFSETS.get(choice, OFFSETS[DEFAULT_OFFSET]))
-
-
-def due_reminders(now):
-    events = notion_query(now.date() - timedelta(days=1), now.date() + timedelta(days=2))
-    due = []
-    for e in events:
-        if e["sent"]:
+def due_important(now):
+    """지금 보내야 할 (일정, 체크할 칸) 목록."""
+    today = now.date()
+    result = []
+    for e in notion_query(today, today + timedelta(days=7)):
+        if not e["important"]:
             continue
-        at = remind_at(e)
-        if at is None:
-            continue
-        deadline = e["start"] + LATE_GRACE if e["has_time"] else e["start"]
-        if at <= now <= deadline:
-            due.append(e)
-    return due
+        days = (e["start"].date() - today).days
+        if 4 <= days <= 7 and not e["sent_week"]:
+            result.append((e, days, "1주 전 알림"))
+        elif 1 <= days <= 3 and not e["sent_three"]:
+            result.append((e, days, "3일 전 알림"))
+    return result
 
 
-def reminder_text(event, now):
+def important_text(event, days):
     if event["has_time"]:
-        minutes = round((event["start"] - now).total_seconds() / 60)
-        if minutes > 90:
-            hours = minutes // 60
-            lead = f"{hours}시간 후" if hours < 24 else "내일"
-        elif minutes > 0:
-            lead = f"{minutes}분 후"
-        else:
-            lead = "지금"
-        lines = [f"⏰ {lead} 일정: {event['title']}",
-                 f"🕒 {event['start']:%m/%d %H:%M}"]
+        when = f"{event['start']:%m/%d %H:%M}"
     else:
-        lines = [f"⏰ 내일 일정: {event['title']}",
-                 f"📅 {event['start']:%m/%d} (종일)"]
+        when = f"{event['start']:%m/%d} (종일)"
+    lines = [f"🔔 중요 일정 {days}일 전: {event['title']}", f"📅 {when}"]
     if event["place"]:
         lines.append(f"📍 {event['place']}")
-    if event["memo"]:
-        lines.append(f"📝 {event['memo']}")
     return "\n".join(lines)
 
 
@@ -276,17 +298,20 @@ def main():
 
     if mode == "brief":
         token = kakao_access_token()
-        kakao_send(token, run_brief(now), link)
+        kakao_send(token, run_brief(now), REPORT_URL)
         print("아침 브리핑을 보냈습니다.")
     elif mode == "remind":
-        due = due_reminders(now)
+        if now.time() < IMPORTANT_FROM:
+            print("아직 알림 시간이 아닙니다.")
+            return
+        due = due_important(now)
         if not due:
             print("보낼 알림이 없습니다.")
             return
         token = kakao_access_token()
-        for e in due:
-            kakao_send(token, reminder_text(e, now), link)
-            notion_mark_sent(e["id"])
+        for event, days, prop in due:
+            kakao_send(token, important_text(event, days), link)
+            notion_check(event["id"], prop)
         print(f"알림 {len(due)}건을 보냈습니다.")
     elif mode == "test":
         token = kakao_access_token()
