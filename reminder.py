@@ -2,7 +2,8 @@
 
 사용법:
     python reminder.py brief    # 아침 8시 브리핑: 오늘 일정과 할 일
-    python reminder.py remind   # 중요 일정의 1주일 전, 3일 전 알림 (아침 8시 이후 1회)
+    python reminder.py remind   # 특별 보고(언제든) + 중요 일정의 1주일 전, 3일 전 알림 (아침 8시 이후 1회)
+    python reminder.py special  # 특별 보고만 보내기
     python reminder.py test     # 연결 시험
 
 필요한 환경 변수:
@@ -23,6 +24,12 @@ NOTION_VERSION = "2022-06-28"
 # 할 일 표와 일일 보고 표
 TODO_DATABASE_ID = "3fe1927d8b2580c7bf8bde3c8af389c1"
 REPORT_URL = "https://www.notion.so/808f8251095c453fb9c22cc8b91b1fde"
+# 정보분석부 '조사 요청' 표 (특별 보고)
+RESEARCH_DATABASE_ID = "ea1bbd79b6584535a1e9dee69a76eb28"
+# 특별 보고를 보내는 상태
+SPECIAL_STATUSES = ("완료", "진 확인 필요")
+# 한 번에 보낼 특별 보고 최대 개수
+SPECIAL_LIMIT = 5
 
 # 중요 일정 알림을 보내기 시작하는 시각
 IMPORTANT_FROM = time(8, 0)
@@ -186,6 +193,38 @@ def notion_todos(today):
     return todos
 
 
+def notion_special_reports():
+    """조사를 마쳤는데 아직 카톡을 보내지 않은 요청. 읽지 못하면 빈 목록."""
+    payload = {
+        "filter": {
+            "and": [
+                {"or": [{"property": "상태", "select": {"equals": s}} for s in SPECIAL_STATUSES]},
+                {"property": "카톡 보냄", "checkbox": {"equals": False}},
+            ]
+        },
+        "page_size": SPECIAL_LIMIT,
+    }
+    try:
+        res = http("POST", f"https://api.notion.com/v1/databases/{RESEARCH_DATABASE_ID}/query",
+                   headers=notion_headers(), data=payload)
+    except SystemExit as e:
+        print(f"조사 요청 표를 읽지 못했습니다(노션 연결에 표가 추가됐는지 확인): {e}")
+        return []
+    reports = []
+    for page in res.get("results", []):
+        props = page["properties"]
+        due = ((props.get("기한") or {}).get("date") or {}).get("start")
+        reports.append({
+            "id": page["id"],
+            "url": page.get("url") or REPORT_URL,
+            "title": plain(props.get("요청", {}).get("title")) or "(제목 없음)",
+            "summary": plain(props.get("결과 한 줄", {}).get("rich_text")),
+            "status": ((props.get("상태") or {}).get("select") or {}).get("name", ""),
+            "due": date.fromisoformat(due[:10]) if due else None,
+        })
+    return reports
+
+
 def notion_check(page_id, prop):
     http("PATCH", f"https://api.notion.com/v1/pages/{page_id}", headers=notion_headers(),
          data={"properties": {prop: {"checkbox": True}}})
@@ -291,16 +330,46 @@ def important_text(event, days):
     return "\n".join(lines)
 
 
+def special_text(report):
+    lines = [f"[특별 보고/정보분석부] {report['title']}"]
+    if report["summary"]:
+        lines.append(report["summary"])
+    if report["status"] == "진 확인 필요":
+        if report["due"]:
+            lines.append(f"⏰ {report['due'].month}/{report['due'].day}까지 확인이 필요해요.")
+        else:
+            lines.append("진 님의 확인이 필요해요.")
+    lines.append("노션에서 결과를 확인해 주세요.")
+    return "\n".join(lines)
+
+
+def send_special(token=None):
+    """특별 보고를 보내고 '카톡 보냄'에 체크한다. 쓴 토큰을 돌려준다."""
+    reports = notion_special_reports()
+    if not reports:
+        print("보낼 특별 보고가 없습니다.")
+        return token
+    token = token or kakao_access_token()
+    for r in reports:
+        kakao_send(token, special_text(r), r["url"])
+        notion_check(r["id"], "카톡 보냄")
+    print(f"특별 보고 {len(reports)}건을 보냈습니다.")
+    return token
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "remind"
     now = datetime.now(KST)
     link = "https://www.notion.so/" + env("NOTION_DATABASE_ID").replace("-", "")
 
-    if mode == "brief":
+    if mode == "special":
+        send_special()
+    elif mode == "brief":
         token = kakao_access_token()
         kakao_send(token, run_brief(now), REPORT_URL)
         print("아침 브리핑을 보냈습니다.")
     elif mode == "remind":
+        token = send_special()
         if now.time() < IMPORTANT_FROM:
             print("아직 알림 시간이 아닙니다.")
             return
@@ -308,7 +377,7 @@ def main():
         if not due:
             print("보낼 알림이 없습니다.")
             return
-        token = kakao_access_token()
+        token = token or kakao_access_token()
         for event, days, prop in due:
             kakao_send(token, important_text(event, days), link)
             notion_check(event["id"], prop)
@@ -318,7 +387,7 @@ def main():
         kakao_send(token, "✅ 일정 알림 연결 테스트 메시지입니다.", link)
         print("테스트 메시지를 보냈습니다.")
     else:
-        sys.exit(f"알 수 없는 모드: {mode} (brief / remind / test)")
+        sys.exit(f"알 수 없는 모드: {mode} (brief / remind / special / test)")
 
 
 if __name__ == "__main__":
